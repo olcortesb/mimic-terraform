@@ -1,0 +1,196 @@
+variables:
+  #AWS_ACCESS_KEY_ID                        - AWS Credentials for MGT Registry Account       - Configured on Gitlab CI/CD Variables
+  #AWS_SECRET_ACCESS_KEY                    - AWS Credentials for MGT Registry Account       - Configured on Gitlab CI/CD Variables
+  #AWS_DEFAULT_REGION                       - AWS Credentials for MGT Registry Account       - Configured on Gitlab CI/CD Variables
+  #LAMBDA_RUNTIME: nodejs18.x               - For node runtime 
+  #LAMBDA_HANDLER: index.handler
+  TERRAFORM_IMAGE: hashicorp/terraform
+  TERRAFORM_VERSION: 1.5.5
+  LAMBDA_RUNTIME: python3.8
+  LAMBDA_HANDLER: lambda_function.lambda_handler
+  TF_IN_AUTOMATION: "yes"
+  TF_STATE_S3: 
+
+.default_rules:
+  rules:
+    - if: $CI_COMMIT_REF_NAME == "main"
+      when: on_success
+    - when: never
+
+cache:
+  paths:
+    - tf-data
+    - terraform.lock.hcl
+
+stages:
+  - sync-with-github
+  - git-clone-lambda-code
+  - npm-install
+  - tf-validate
+  - tf-plan
+  - tf-apply
+  - tf-destroy
+
+# Sync Repository
+sync-with-github:
+  stage: sync-with-github
+  image: alpine
+  before_script:
+    - apk add git
+  script:
+    - rm -rf .git
+    - git init
+    - git config --global user.email "olcortesb@gmail.com"
+    - git config --global user.name "olcortesb"
+    - git remote add github https://$ACCESS_TOKEN@github.com/olcortesb/mimic-terraform.git
+    - git branch -m master main
+    - git add .
+    - git commit -m "$CI_COMMIT_MESSAGE"
+    - git status
+    - git push github main --force
+
+
+# Clone repository
+git-clone-lambda-code:
+  stage: git-clone-lambda-code
+  image: alpine
+  before_script:
+    - apk add git
+  script:
+    - git clone --depth=1 -b main https://gitlab-ci-token:${CI_JOB_TOKEN}@gitlab.com/serverless4741110/lambdas-src repository
+    - rm -rf source_code/.git
+    - cd repository
+    - rm LICENSE
+    - rm README.md
+  artifacts:
+    paths:
+      - repository
+
+npm-install:
+  stage: npm-install
+  image: node:18
+  before_script:
+    - ls
+    - npm --version
+  script:
+    - cd repository/src
+    - npm install
+  artifacts:
+    paths:
+      - repository
+
+
+# Common image & before_script for terraform
+image:
+  #name: ackstorm/terraform-aws:${TERRAFORM_VERSION}
+  name: ${TERRAFORM_IMAGE}:${TERRAFORM_VERSION}
+  entrypoint:
+    - '/usr/bin/env'
+    - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+before_script:
+  - terraform --version
+  - export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+  - export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+  - |
+      # Overwrite variables in default(master/main) branch
+      if [ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]; then
+        export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID} 
+        export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      fi
+  - echo Running terraform init
+  - terraform init
+
+tf-validate:
+  stage: tf-validate
+  rules:
+    - !reference [.default_rules, rules]
+  script:
+    - ls 
+    - terraform validate
+
+tf-plan:
+  stage: tf-plan
+  rules:
+    - !reference [.default_rules, rules]
+  script:
+    - terraform plan -out=plan.tfplan
+    - terraform show -no-color plan.tfplan > plan.txt
+    - sed -i -e 's/  +/+/g' plan.txt
+    - sed -i -e 's/  ~/~/g' plan.txt
+    - sed -i -e 's/  -/-/g' plan.txt
+    - sed -i '/^[[:space:]]*$/d' plan.txt
+    - MESSAGE=$(cat plan.txt)
+  artifacts:
+    name: plan
+    paths:
+      - plan.txt
+      - plan.tfplan
+      - repository
+   
+# tf-check-destroy-main:
+#   stage: tf-check
+#   dependencies:
+#     - tf-plan
+#   before_script:
+#     - echo "Override default before_script"
+#   script:
+#     - |
+#       echo "Checking destroy safe plan"
+#       echo "To skip failure run again the pipeline and set a variable with key=DESTROY and value=OK"
+#       cat  plan.txt | egrep -q '(Your infrastructure matches the configuration|, 0 to destroy)';
+#   rules:
+#   - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $DESTROY != "OK"
+
+# tf-check-security:
+#   stage: tf-check
+#   image: python:3.11
+#   before_script:
+#     - echo "" # Just override
+#   script:
+#     - pip3 install wheel checkov
+#     - checkov -d ./ -o junitxml > junit.xml || true
+#     - cat junit.xml
+#   allow_failure: false
+#   interruptible: true
+#   artifacts:
+#     paths: [junit.xml]
+#     reports: 
+#       junit: junit.xml
+#   rules:
+#     - !reference [.default_rules, rules]
+
+tf-apply:
+  stage: tf-apply
+#  rules:
+#    - !reference [.default_rules, rules]
+  script:
+    - ls
+    - terraform apply -input=false plan.tfplan
+  when: manual
+  dependencies:
+    - tf-plan
+  allow_failure: false
+  rules:
+  - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $DESTROY != "OK"
+
+
+tf-check-destroy-main:
+  stage: tf-destroy
+  dependencies:
+    - tf-plan
+  before_script:
+    - terraform --version
+    - export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+    - export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    - |
+        # Overwrite variables in default(master/main) branch
+        if [ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]; then
+          export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID} 
+          export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+        fi
+    - echo Running terraform init
+    - terraform init
+  script:
+    - terraform destroy -auto-approve
+  rules:
+  - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $DESTROY == "OK"
